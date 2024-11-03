@@ -6,6 +6,7 @@ __copyright__ = '2011, Grant Drake'
 import socket, re, datetime, json
 from collections import OrderedDict
 from threading import Thread
+import requests
 
 from lxml.html import tostring
 from six import text_type as unicode
@@ -16,6 +17,14 @@ from calibre.utils.localization import canonicalize_lang
 from calibre.utils.date import utcfromtimestamp
 import calibre_plugins.goodreads.config as cfg
 
+# Define your desired tags
+DESIRED_TAGS = { "Art", "Biography", "Business", "Chick Lit", "Children's", "Christian",
+                 "Classics", "Comics", "Contemporary", "Cookbooks", "Crime",
+                 "Fantasy", "LGBT", "Erotica", "Graphic Novels", "Historical Fiction",
+                 "History", "Horror", "Humor", "Manga", "Memoir", "Music", "Mystery",
+                 "Nonfiction", "Paranormal", "Philosophy", "Poetry", "Psychology",
+                 "Religion", "Romance", "Technology and Computers", "Science Fiction",
+                 "Self Help", "Suspense", "Spirituality", "Sports", "Thriller", "Travel", "Young Adult" }
 
 def clean_html(raw):
     from calibre.ebooks.chardet import xml_to_unicode
@@ -496,6 +505,102 @@ class Worker(Thread): # Get details
         self.log.info("parse_tags: %s"%','.join(calibre_tags))
         if len(calibre_tags) > 0:
             return calibre_tags
+
+
+
+
+   def parse_tags(self, book_json):
+       """
+       Parses tags from Goodreads genres, and if necessary, calls the LLM to categorize the book.
+
+       Args:
+          book_json (dict): The JSON data for the book, containing genres and other metadata.
+
+       Returns:
+           list: A list of validated tags, potentially including those added by the LLM.
+       """
+       # Goodreads does not have "tags", but it does have Genres (wrapper around popular shelves)
+       # We will use those as tags (with a bit of massaging)
+       # In 2022 version there is no hierarchy of genres, so just a flat list of tags really.
+       if "bookGenres" not in book_json:
+           return []
+    
+       genre_tags = []
+       for book_genre_json in book_json["bookGenres"]:
+           if "genre" in book_genre_json:
+               genre_name = book_genre_json["genre"]["name"]
+               genre_tags.append(genre_name)
+    
+       # Convert Goodreads genres to Calibre-compatible tags
+       calibre_tags = self._convert_genres_to_calibre_tags(genre_tags)
+       self.log.info("parse_tags: %s" % ','.join(calibre_tags))
+    
+       # Check if any of the tags match DESIRED_TAGS, case-insensitively
+       matching_tags = {tag for tag in calibre_tags if tag.lower() in map(str.lower, DESIRED_TAGS)}
+       if matching_tags:
+          return list(calibre_tags)  # Return list including existing desired tags
+    
+       # If no desired tags found, make an LLM call for categorization
+       llm_tags = self.filter_llm_generated_tags(book_json)
+       return llm_tags + calibre_tags
+
+    def filter_llm_generated_tags(self, book_json):
+       """
+       Calls the local LLM (e.g., Ollama, LM Studio) to categorize the book and filters response for desired tags.
+
+       Args:
+           book_json (dict): Book information including title and description.
+
+       Returns:
+           list: A list of tags from DESIRED_TAGS that appear in the LLM response.
+       """
+       # Construct the prompt
+       prompt = f"Classify the following book described, replying with ONLY one or more of these tags: {', '.join(DESIRED_TAGS)}.\n\n"
+       prompt += f"Title: {book_json['title']}\n"
+       if 'description' in book_json:
+           prompt += f"Description: {book_json['description']}\n"
+
+       # LLM API call setup
+       llm_url = "http://192.168.1.203:11435/endpoint"  # Replace PORT with the correct port
+       headers = {"Content-Type": "application/json"}
+       payload = {
+           "prompt": prompt,
+           "model": "mistral"  # Replace with the model name or ID specific to Ollama or LM Studio
+       }
+    
+       # Make the API call and parse response
+       try:
+          response = requests.post(llm_url, json=payload, headers=headers)
+          response.raise_for_status()  # Raise an exception for HTTP errors
+          llm_response = response.json().get("text", "").strip()
+        
+          # Filter out only the desired tags from the LLM response
+          matched_tags = self.match_desired_tags(llm_response, DESIRED_TAGS)
+        
+          # Return list of matched tags, or empty list if none found
+          return matched_tags
+    
+        except requests.RequestException as e:
+            self.log.info(f"Error contacting LLM: {e}")
+            return []  # Fallback to an empty list if the LLM call fails
+
+    def match_desired_tags(self, response_text, desired_tags):
+        """
+        Matches any tags in desired_tags that are found in the response_text.
+    
+        Args:
+           response_text (str): The text response from the LLM.
+           desired_tags (set): The set of tags we're interested in.
+
+        Returns:
+           list: A list of matched tags from desired_tags.
+       """
+       # Normalize and split response text for easier matching
+       response_tags = re.split(r'[,\n]', response_text.lower())
+       response_tags = [tag.strip().capitalize() for tag in response_tags]
+    
+       # Filter for tags in the desired set
+       return [tag for tag in response_tags if tag in desired_tags]
 
     def _convert_genres_to_calibre_tags(self, genre_tags):
         map_genres = cfg.plugin_prefs[cfg.STORE_NAME].get(cfg.KEY_MAP_GENRES, cfg.DEFAULT_STORE_VALUES[cfg.KEY_MAP_GENRES])
